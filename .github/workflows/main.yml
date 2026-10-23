@@ -1,0 +1,992 @@
+name: Build Camera From Phone (iOS IPA)
+
+# Clap Sister Clap Studios
+# Put this ONE file in your new repo at .github/workflows/build-ios.yml.
+# It writes the whole Swift app itself, builds it on a Mac runner without code signing,
+# and gives you an unsigned CameraFromPhone.ipa as a downloadable artifact.
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Write project files
+        run: |
+          mkdir -p app/Config && cd app
+          mkdir -p "$(dirname 'project.yml')"
+          cat > 'project.yml' <<'CSC_EOF_0'
+          name: CameraFromPhone
+          options:
+            bundleIdPrefix: com.clapsisterclapstudios
+            createIntermediateGroups: true
+          targets:
+            CameraFromPhone:
+              type: application
+              platform: iOS
+              deploymentTarget: "15.0"
+              sources:
+                - path: Sources
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.clapsisterclapstudios.camerafromphone
+                  PRODUCT_NAME: CameraFromPhone
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+              info:
+                path: Config/Info.plist
+                properties:
+                  CFBundleDisplayName: Camera From Phone
+                  NSHumanReadableCopyright: "Copyright Clap Sister Clap Studios"
+                  NSCameraUsageDescription: "Camera From Phone streams your front camera to your PS4."
+                  NSLocalNetworkUsageDescription: "Camera From Phone connects to your PS4 over your Wi-Fi network."
+                  UILaunchScreen: {}
+                  UIRequiresFullScreen: true
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+                  UISupportedInterfaceOrientations~ipad:
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+          CSC_EOF_0
+          mkdir -p "$(dirname 'Sources/Protocol.swift')"
+          cat > 'Sources/Protocol.swift' <<'CSC_EOF_1'
+          import Foundation
+
+          // Camera From Phone wire protocol. Must match protocol.h in the PS4 app.
+          //
+          // Packet = "CFP1" + type (1 byte) + payload length (4 bytes, little endian) + payload.
+          enum CFP {
+              static let magic: [UInt8] = Array("CFP1".utf8)
+              static let headerSize = 9
+              static let defaultPort: UInt16 = 9777
+              static let maxReplyPayload = 64 * 1024
+
+              enum PacketType: UInt8 {
+                  case hello = 0x01
+                  case helloOK = 0x02
+                  case helloReject = 0x03
+                  case frame = 0x10
+                  case ping = 0x20
+                  case bye = 0x21
+              }
+
+              static func packet(_ type: PacketType, payload: Data = Data()) -> Data {
+                  var data = Data(magic)
+                  data.append(type.rawValue)
+                  let length = UInt32(payload.count)
+                  data.append(UInt8(length & 0xFF))
+                  data.append(UInt8((length >> 8) & 0xFF))
+                  data.append(UInt8((length >> 16) & 0xFF))
+                  data.append(UInt8((length >> 24) & 0xFF))
+                  data.append(payload)
+                  return data
+              }
+          }
+
+          enum ConnectionError: LocalizedError {
+              case invalidAddress
+              case timedOut
+              case rejected(String)
+              case closed
+              case failed(String)
+
+              var errorDescription: String? {
+                  switch self {
+                  case .invalidAddress:
+                      return "That address doesn't look right. Type the one shown on the PS4 screen, like 192.168.1.20"
+                  case .timedOut:
+                      return "Couldn't reach the PS4. Make sure the PS4 app is on its pairing screen, both devices are on the same Wi-Fi, and Local Network access is allowed for this app in Settings."
+                  case .rejected(let reason):
+                      return "The PS4 said: \(reason). Check the pairing code on the TV."
+                  case .closed:
+                      return "The PS4 closed the connection."
+                  case .failed(let message):
+                      return "Connection failed: \(message)"
+                  }
+              }
+          }
+          CSC_EOF_1
+          mkdir -p "$(dirname 'Sources/PS4Connection.swift')"
+          cat > 'Sources/PS4Connection.swift' <<'CSC_EOF_2'
+          import Foundation
+          import Network
+
+          /// One TCP connection to the PS4 app: pairing handshake, keep-alive pings and JPEG frame sending.
+          final class PS4Connection {
+              struct Packet {
+                  let type: UInt8
+                  let payload: Data
+              }
+
+              /// Called on the main queue if the connection drops after it was established.
+              var onClosed: ((Error?) -> Void)?
+
+              private let queue = DispatchQueue(label: "cfp.connection")
+              private var conn: NWConnection?
+              private var pingTimer: DispatchSourceTimer?
+              private var closed = false
+              private var established = false
+
+              private let lock = NSLock()
+              private var inFlight = false
+              private var sentSinceCheck = 0
+
+              /// True while a frame is still being written to the socket (the camera drops frames meanwhile).
+              var isBusy: Bool {
+                  lock.lock()
+                  defer { lock.unlock() }
+                  return inFlight
+              }
+
+              /// Number of frames sent since the last call.
+              func takeFrameCount() -> Int {
+                  lock.lock()
+                  defer { lock.unlock() }
+                  let n = sentSinceCheck
+                  sentSinceCheck = 0
+                  return n
+              }
+
+              // MARK: connect + handshake
+
+              func connect(host: String, port: UInt16, code: String, deviceName: String,
+                           completion: @escaping (Result<Void, Error>) -> Void) {
+                  queue.async {
+                      guard let nwPort = NWEndpoint.Port(rawValue: port), !host.isEmpty else {
+                          DispatchQueue.main.async { completion(.failure(ConnectionError.invalidAddress)) }
+                          return
+                      }
+
+                      let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: .tcp)
+                      self.conn = connection
+
+                      var finished = false
+                      let finish: (Result<Void, Error>) -> Void = { result in
+                          if finished { return }
+                          finished = true
+                          switch result {
+                          case .success:
+                              self.established = true
+                              self.startPing()
+                              self.watchForClose(connection)
+                          case .failure:
+                              self.shutdown(sendBye: false)
+                          }
+                          DispatchQueue.main.async { completion(result) }
+                      }
+
+                      connection.stateUpdateHandler = { state in
+                          switch state {
+                          case .ready:
+                              if !finished {
+                                  self.handshake(connection, code: code, deviceName: deviceName, finish: finish)
+                              }
+                          case .failed(let error):
+                              if finished {
+                                  self.handleClosed(error)
+                              } else {
+                                  finish(.failure(ConnectionError.failed(error.localizedDescription)))
+                              }
+                          default:
+                              break
+                          }
+                      }
+
+                      self.queue.asyncAfter(deadline: .now() + 8) {
+                          if !finished {
+                              finish(.failure(ConnectionError.timedOut))
+                          }
+                      }
+
+                      connection.start(queue: self.queue)
+                  }
+              }
+
+              private func handshake(_ c: NWConnection, code: String, deviceName: String,
+                                     finish: @escaping (Result<Void, Error>) -> Void) {
+                  var payload = Data(code.utf8)
+                  payload.append(Data(deviceName.utf8.prefix(24)))
+
+                  c.send(content: CFP.packet(.hello, payload: payload), completion: .contentProcessed { error in
+                      if let error = error {
+                          finish(.failure(ConnectionError.failed(error.localizedDescription)))
+                          return
+                      }
+                      self.readPacket(c) { result in
+                          switch result {
+                          case .failure(let error):
+                              finish(.failure(error))
+                          case .success(let packet):
+                              if packet.type == CFP.PacketType.helloOK.rawValue {
+                                  finish(.success(()))
+                              } else if packet.type == CFP.PacketType.helloReject.rawValue {
+                                  let reason = String(decoding: packet.payload, as: UTF8.self)
+                                  finish(.failure(ConnectionError.rejected(reason)))
+                              } else {
+                                  finish(.failure(ConnectionError.failed("Unexpected reply from the PS4.")))
+                              }
+                          }
+                      }
+                  })
+              }
+
+              // MARK: receiving
+
+              private func receiveExactly(_ c: NWConnection, count: Int,
+                                          completion: @escaping (Result<Data, Error>) -> Void) {
+                  if count == 0 {
+                      completion(.success(Data()))
+                      return
+                  }
+                  c.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
+                      if let error = error {
+                          completion(.failure(error))
+                      } else if let data = data, data.count == count {
+                          completion(.success(data))
+                      } else {
+                          completion(.failure(ConnectionError.closed))
+                      }
+                  }
+              }
+
+              private func readPacket(_ c: NWConnection, completion: @escaping (Result<Packet, Error>) -> Void) {
+                  receiveExactly(c, count: CFP.headerSize) { result in
+                      switch result {
+                      case .failure(let error):
+                          completion(.failure(error))
+                      case .success(let header):
+                          let bytes = [UInt8](header)
+                          guard Array(bytes[0..<4]) == CFP.magic else {
+                              completion(.failure(ConnectionError.failed("That doesn't look like the Camera From Phone PS4 app.")))
+                              return
+                          }
+                          var length = 0
+                          for i in 0..<4 {
+                              length |= Int(bytes[5 + i]) << (8 * i)
+                          }
+                          guard length <= CFP.maxReplyPayload else {
+                              completion(.failure(ConnectionError.failed("Unexpected reply from the PS4.")))
+                              return
+                          }
+                          let type = bytes[4]
+                          self.receiveExactly(c, count: length) { bodyResult in
+                              switch bodyResult {
+                              case .failure(let error):
+                                  completion(.failure(error))
+                              case .success(let body):
+                                  completion(.success(Packet(type: type, payload: body)))
+                              }
+                          }
+                      }
+                  }
+              }
+
+              /// After pairing the PS4 sends nothing we need, but reading lets us notice when it goes away.
+              private func watchForClose(_ c: NWConnection) {
+                  readPacket(c) { [weak self] result in
+                      guard let self = self else { return }
+                      switch result {
+                      case .success(let packet):
+                          if packet.type == CFP.PacketType.bye.rawValue {
+                              self.handleClosed(nil)
+                          } else {
+                              self.watchForClose(c)
+                          }
+                      case .failure(let error):
+                          self.handleClosed(error)
+                      }
+                  }
+              }
+
+              // MARK: sending
+
+              func sendFrame(_ jpeg: Data) {
+                  queue.async {
+                      guard !self.closed, self.established, let c = self.conn else { return }
+
+                      self.lock.lock()
+                      if self.inFlight {
+                          self.lock.unlock()
+                          return
+                      }
+                      self.inFlight = true
+                      self.lock.unlock()
+
+                      c.send(content: CFP.packet(.frame, payload: jpeg), completion: .contentProcessed { [weak self] error in
+                          guard let self = self else { return }
+                          self.lock.lock()
+                          self.inFlight = false
+                          if error == nil {
+                              self.sentSinceCheck += 1
+                          }
+                          self.lock.unlock()
+                          if let error = error {
+                              self.handleClosed(error)
+                          }
+                      })
+                  }
+              }
+
+              // The PS4 drops the link after 5 s of silence, so ping once a second when no frame is in flight.
+              private func startPing() {
+                  let timer = DispatchSource.makeTimerSource(queue: queue)
+                  timer.schedule(deadline: .now() + 1, repeating: 1)
+                  timer.setEventHandler { [weak self] in
+                      guard let self = self, !self.closed, let c = self.conn else { return }
+                      if self.isBusy { return }
+                      c.send(content: CFP.packet(.ping), completion: .contentProcessed { _ in })
+                  }
+                  timer.resume()
+                  pingTimer = timer
+              }
+
+              // MARK: closing
+
+              func close(sendBye: Bool) {
+                  queue.async {
+                      self.shutdown(sendBye: sendBye)
+                  }
+              }
+
+              private func handleClosed(_ error: Error?) {
+                  if closed { return }
+                  shutdown(sendBye: false)
+                  DispatchQueue.main.async {
+                      self.onClosed?(error)
+                  }
+              }
+
+              // Must run on `queue`.
+              private func shutdown(sendBye: Bool) {
+                  if closed { return }
+                  closed = true
+
+                  pingTimer?.cancel()
+                  pingTimer = nil
+
+                  guard let c = conn else { return }
+
+                  if sendBye && established {
+                      c.send(content: CFP.packet(.bye), completion: .contentProcessed { _ in
+                          c.cancel()
+                      })
+                      queue.asyncAfter(deadline: .now() + 1) {
+                          c.cancel()
+                      }
+                  } else {
+                      c.cancel()
+                  }
+              }
+          }
+          CSC_EOF_2
+          mkdir -p "$(dirname 'Sources/CameraStreamer.swift')"
+          cat > 'Sources/CameraStreamer.swift' <<'CSC_EOF_3'
+          import AVFoundation
+          import CoreImage
+          import UIKit
+
+          enum StreamQuality: String, CaseIterable, Identifiable {
+              case standard = "640x480"
+              case hd = "1280x720"
+
+              var id: String { rawValue }
+
+              var preset: AVCaptureSession.Preset {
+                  switch self {
+                  case .standard: return .vga640x480
+                  case .hd: return .hd1280x720
+                  }
+              }
+
+              var jpegQuality: CGFloat {
+                  switch self {
+                  case .standard: return 0.65
+                  case .hd: return 0.55
+                  }
+              }
+          }
+
+          enum CameraError: LocalizedError {
+              case noFrontCamera
+              case cannotConfigure
+
+              var errorDescription: String? {
+                  switch self {
+                  case .noFrontCamera: return "This device has no front camera."
+                  case .cannotConfigure: return "Couldn't start the front camera."
+                  }
+              }
+          }
+
+          /// Captures the FRONT camera and hands every frame over as a JPEG.
+          final class CameraStreamer: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+              let session = AVCaptureSession()
+
+              /// Asked before each frame is encoded; return false to drop the frame cheaply.
+              var shouldAcceptFrame: (() -> Bool)?
+              var onFrame: ((Data) -> Void)?
+
+              private let sessionQueue = DispatchQueue(label: "cfp.camera.session")
+              private let outputQueue = DispatchQueue(label: "cfp.camera.output")
+              private let output = AVCaptureVideoDataOutput()
+              private let ciContext = CIContext()
+              private var configured = false
+              private var jpegQuality: CGFloat = 0.65
+
+              func start(quality: StreamQuality, orientation: AVCaptureVideoOrientation,
+                         completion: @escaping (Error?) -> Void) {
+                  sessionQueue.async {
+                      do {
+                          try self.configure(quality: quality)
+                          self.applyOrientation(orientation)
+                          if !self.session.isRunning {
+                              self.session.startRunning()
+                          }
+                          DispatchQueue.main.async { completion(nil) }
+                      } catch {
+                          DispatchQueue.main.async { completion(error) }
+                      }
+                  }
+              }
+
+              func stop() {
+                  sessionQueue.async {
+                      if self.session.isRunning {
+                          self.session.stopRunning()
+                      }
+                      self.output.setSampleBufferDelegate(nil, queue: nil)
+                      self.session.beginConfiguration()
+                      for input in self.session.inputs {
+                          self.session.removeInput(input)
+                      }
+                      for out in self.session.outputs {
+                          self.session.removeOutput(out)
+                      }
+                      self.session.commitConfiguration()
+                      self.configured = false
+                  }
+              }
+
+              func updateOrientation(_ orientation: AVCaptureVideoOrientation) {
+                  sessionQueue.async {
+                      self.applyOrientation(orientation)
+                  }
+              }
+
+              // Runs on sessionQueue.
+              private func configure(quality: StreamQuality) throws {
+                  if configured { return }
+
+                  guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front) else {
+                      throw CameraError.noFrontCamera
+                  }
+                  let input = try AVCaptureDeviceInput(device: device)
+
+                  session.beginConfiguration()
+
+                  if session.canSetSessionPreset(quality.preset) {
+                      session.sessionPreset = quality.preset
+                  }
+
+                  guard session.canAddInput(input) else {
+                      session.commitConfiguration()
+                      throw CameraError.cannotConfigure
+                  }
+                  session.addInput(input)
+
+                  output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+                  output.alwaysDiscardsLateVideoFrames = true
+                  output.setSampleBufferDelegate(self, queue: outputQueue)
+
+                  guard session.canAddOutput(output) else {
+                      session.commitConfiguration()
+                      throw CameraError.cannotConfigure
+                  }
+                  session.addOutput(output)
+
+                  // Send the picture un-mirrored; the PS4 app mirrors it like a selfie preview.
+                  if let connection = output.connection(with: .video), connection.isVideoMirroringSupported {
+                      connection.automaticallyAdjustsVideoMirroring = false
+                      connection.isVideoMirrored = false
+                  }
+
+                  session.commitConfiguration()
+
+                  // 30 fps is plenty over Wi-Fi.
+                  do {
+                      try device.lockForConfiguration()
+                      device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+                      device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+                      device.unlockForConfiguration()
+                  } catch {
+                      // Not fatal: the camera just keeps its default frame rate.
+                  }
+
+                  jpegQuality = quality.jpegQuality
+                  configured = true
+              }
+
+              // Runs on sessionQueue.
+              private func applyOrientation(_ orientation: AVCaptureVideoOrientation) {
+                  if let connection = output.connection(with: .video), connection.isVideoOrientationSupported {
+                      connection.videoOrientation = orientation
+                  }
+              }
+
+              // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
+
+              func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer,
+                                 from connection: AVCaptureConnection) {
+                  guard shouldAcceptFrame?() == true else { return }
+                  guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+
+                  let image = CIImage(cvPixelBuffer: pixelBuffer)
+                  guard let cgImage = ciContext.createCGImage(image, from: image.extent) else { return }
+                  guard let jpeg = UIImage(cgImage: cgImage).jpegData(compressionQuality: jpegQuality) else { return }
+
+                  onFrame?(jpeg)
+              }
+          }
+
+          /// Current screen orientation expressed as a capture orientation (the raw values match).
+          func currentVideoOrientation() -> AVCaptureVideoOrientation {
+              let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+              if let interface = scene?.interfaceOrientation,
+                 let orientation = AVCaptureVideoOrientation(rawValue: interface.rawValue) {
+                  return orientation
+              }
+              return .landscapeRight
+          }
+          CSC_EOF_3
+          mkdir -p "$(dirname 'Sources/AppModel.swift')"
+          cat > 'Sources/AppModel.swift' <<'CSC_EOF_4'
+          import AVFoundation
+          import SwiftUI
+          import UIKit
+
+          /// Drives the whole flow: connect to the PS4, ask for camera access, stream the front camera.
+          final class AppModel: ObservableObject {
+              enum Phase: Equatable {
+                  case idle
+                  case connecting
+                  case askingCamera
+                  case streaming
+                  case failed(String)
+
+                  var isLive: Bool { self == .askingCamera || self == .streaming }
+                  var isConnecting: Bool { self == .connecting }
+              }
+
+              @Published private(set) var phase: Phase = .idle
+              @Published private(set) var fps: Int = 0
+
+              let camera = CameraStreamer()
+
+              private var connection: PS4Connection?
+              private var statsTimer: Timer?
+
+              // MARK: user actions
+
+              func connect(address: String, code: String, quality: StreamQuality) {
+                  if phase.isLive || phase.isConnecting { return }
+
+                  guard let target = parseAddress(address) else {
+                      phase = .failed(ConnectionError.invalidAddress.localizedDescription)
+                      return
+                  }
+                  let cleanCode = code.trimmingCharacters(in: .whitespaces)
+                  guard cleanCode.count == 4, cleanCode.allSatisfy({ $0.isNumber }) else {
+                      phase = .failed("Enter the 4-digit pairing code shown on the TV.")
+                      return
+                  }
+
+                  phase = .connecting
+
+                  let conn = PS4Connection()
+                  conn.onClosed = { [weak self] _ in
+                      self?.connectionDropped()
+                  }
+                  connection = conn
+
+                  conn.connect(host: target.host, port: target.port, code: cleanCode,
+                               deviceName: UIDevice.current.model) { [weak self] result in
+                      guard let self = self, self.connection === conn else { return }
+                      switch result {
+                      case .success:
+                          self.connected(quality: quality)
+                      case .failure(let error):
+                          self.fail(error.localizedDescription)
+                      }
+                  }
+              }
+
+              func disconnect(message: String? = nil) {
+                  teardown(sendBye: true)
+                  if let message = message {
+                      phase = .failed(message)
+                  } else {
+                      phase = .idle
+                  }
+              }
+
+              func orientationChanged(_ orientation: AVCaptureVideoOrientation) {
+                  camera.updateOrientation(orientation)
+              }
+
+              // MARK: flow
+
+              // The PS4 now shows "Successfully connected". Next: camera permission, then frames.
+              private func connected(quality: StreamQuality) {
+                  phase = .askingCamera
+                  UIApplication.shared.isIdleTimerDisabled = true
+
+                  requestCameraAccess { [weak self] granted in
+                      guard let self = self, self.connection != nil else { return }
+                      if granted {
+                          self.startCamera(quality: quality)
+                      } else {
+                          self.fail("Camera access is off. Allow it in Settings > Camera From Phone, then connect again.")
+                      }
+                  }
+              }
+
+              private func requestCameraAccess(_ completion: @escaping (Bool) -> Void) {
+                  switch AVCaptureDevice.authorizationStatus(for: .video) {
+                  case .authorized:
+                      completion(true)
+                  case .notDetermined:
+                      AVCaptureDevice.requestAccess(for: .video) { granted in
+                          DispatchQueue.main.async { completion(granted) }
+                      }
+                  default:
+                      completion(false)
+                  }
+              }
+
+              private func startCamera(quality: StreamQuality) {
+                  guard let conn = connection else { return }
+
+                  camera.shouldAcceptFrame = { [weak conn] in
+                      guard let conn = conn else { return false }
+                      return !conn.isBusy
+                  }
+                  camera.onFrame = { [weak conn] data in
+                      conn?.sendFrame(data)
+                  }
+
+                  camera.start(quality: quality, orientation: currentVideoOrientation()) { [weak self] error in
+                      guard let self = self, self.connection != nil else { return }
+                      if let error = error {
+                          self.fail(error.localizedDescription)
+                          return
+                      }
+                      self.phase = .streaming
+                      self.startStats()
+                  }
+              }
+
+              private func startStats() {
+                  statsTimer?.invalidate()
+                  statsTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                      guard let self = self else { return }
+                      self.fps = self.connection?.takeFrameCount() ?? 0
+                  }
+              }
+
+              private func connectionDropped() {
+                  guard phase.isLive else { return }
+                  teardown(sendBye: false)
+                  phase = .failed("Lost connection to the PS4. Make sure its app is still on the pairing screen, then connect again.")
+              }
+
+              private func fail(_ message: String) {
+                  teardown(sendBye: true)
+                  phase = .failed(message)
+              }
+
+              private func teardown(sendBye: Bool) {
+                  statsTimer?.invalidate()
+                  statsTimer = nil
+                  camera.onFrame = nil
+                  camera.shouldAcceptFrame = nil
+                  camera.stop()
+                  connection?.onClosed = nil
+                  connection?.close(sendBye: sendBye)
+                  connection = nil
+                  fps = 0
+                  UIApplication.shared.isIdleTimerDisabled = false
+              }
+
+              // Accepts "192.168.1.20", "192.168.1.20:9777" or "ps4.local".
+              private func parseAddress(_ text: String) -> (host: String, port: UInt16)? {
+                  var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                  if let range = s.range(of: "://") {
+                      s = String(s[range.upperBound...])
+                  }
+                  if s.isEmpty { return nil }
+
+                  var host = s
+                  var port = CFP.defaultPort
+                  if let colon = s.lastIndex(of: ":") {
+                      host = String(s[s.startIndex..<colon])
+                      guard let parsed = UInt16(s[s.index(after: colon)...]), parsed > 0 else { return nil }
+                      port = parsed
+                  }
+                  if host.isEmpty { return nil }
+                  return (host: host, port: port)
+              }
+          }
+          CSC_EOF_4
+          mkdir -p "$(dirname 'Sources/ContentView.swift')"
+          cat > 'Sources/ContentView.swift' <<'CSC_EOF_5'
+          import AVFoundation
+          import SwiftUI
+          import UIKit
+
+          @main
+          struct CameraFromPhoneApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+
+          struct ContentView: View {
+              @StateObject private var model = AppModel()
+              @Environment(\.scenePhase) private var scenePhase
+
+              @AppStorage("ps4Address") private var address = ""
+              @AppStorage("streamQuality") private var qualityRaw = StreamQuality.standard.rawValue
+              @State private var code = ""
+
+              private var quality: StreamQuality {
+                  StreamQuality(rawValue: qualityRaw) ?? .standard
+              }
+
+              var body: some View {
+                  ZStack {
+                      Color(red: 0.05, green: 0.08, blue: 0.11)
+                          .ignoresSafeArea()
+
+                      if model.phase.isLive {
+                          liveScreen
+                      } else {
+                          connectScreen
+                      }
+                  }
+                  .preferredColorScheme(.dark)
+                  .onChange(of: scenePhase) { newPhase in
+                      if newPhase == .background && model.phase.isLive {
+                          model.disconnect(message: "Disconnected because the app was closed. Streaming only works while it is open.")
+                      }
+                  }
+              }
+
+              // MARK: connect screen
+
+              private var connectScreen: some View {
+                  ScrollView {
+                      VStack(spacing: 16) {
+                          Text("Camera From Phone")
+                              .font(.largeTitle.bold())
+
+                          Text("by Clap Sister Clap Studios")
+                              .font(.footnote.weight(.semibold))
+                              .foregroundColor(.accentColor)
+
+                          Text("Open the app on your PS4, then type the address and pairing code shown on the TV.")
+                              .font(.subheadline)
+                              .foregroundColor(.secondary)
+                              .multilineTextAlignment(.center)
+
+                          TextField("PS4 address (192.168.1.20)", text: $address)
+                              .keyboardType(.numbersAndPunctuation)
+                              .textInputAutocapitalization(.never)
+                              .disableAutocorrection(true)
+                              .textFieldStyle(.roundedBorder)
+
+                          TextField("4-digit pairing code", text: $code)
+                              .keyboardType(.numberPad)
+                              .textFieldStyle(.roundedBorder)
+                              .onChange(of: code) { newValue in
+                                  let cleaned = String(newValue.filter { $0.isNumber }.prefix(4))
+                                  if cleaned != newValue {
+                                      code = cleaned
+                                  }
+                              }
+
+                          Picker("Quality", selection: $qualityRaw) {
+                              ForEach(StreamQuality.allCases) { option in
+                                  Text(option.rawValue).tag(option.rawValue)
+                              }
+                          }
+                          .pickerStyle(.segmented)
+
+                          if case .failed(let message) = model.phase {
+                              Text(message)
+                                  .font(.footnote)
+                                  .foregroundColor(.red)
+                                  .multilineTextAlignment(.center)
+                          }
+
+                          Button {
+                              model.connect(address: address, code: code, quality: quality)
+                          } label: {
+                              HStack(spacing: 8) {
+                                  if model.phase.isConnecting {
+                                      ProgressView()
+                                  }
+                                  Text(model.phase.isConnecting ? "Connecting..." : "Connect")
+                                      .fontWeight(.semibold)
+                              }
+                              .frame(maxWidth: .infinity)
+                          }
+                          .buttonStyle(.borderedProminent)
+                          .controlSize(.large)
+                          .disabled(model.phase.isConnecting)
+                      }
+                      .padding(24)
+                      .frame(maxWidth: 520)
+                      .frame(maxWidth: .infinity)
+                  }
+              }
+
+              // MARK: live screen (paired with the PS4)
+
+              private var liveScreen: some View {
+                  ZStack {
+                      if model.phase == .streaming {
+                          CameraPreview(session: model.camera.session) { orientation in
+                              model.orientationChanged(orientation)
+                          }
+                          .ignoresSafeArea()
+                      }
+
+                      VStack(alignment: .leading) {
+                          HStack(spacing: 10) {
+                              Circle()
+                                  .fill(Color.green)
+                                  .frame(width: 12, height: 12)
+                              Text(statusText)
+                                  .font(.headline)
+                                  .foregroundColor(.white)
+                          }
+                          .padding(.horizontal, 14)
+                          .padding(.vertical, 10)
+                          .background(Color.black.opacity(0.6))
+                          .clipShape(Capsule())
+
+                          Spacer()
+
+                          HStack {
+                              Spacer()
+                              Button("Disconnect") {
+                                  model.disconnect()
+                              }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.red)
+                              .controlSize(.large)
+                          }
+                      }
+                      .padding(20)
+                  }
+              }
+
+              private var statusText: String {
+                  if model.phase == .streaming {
+                      return "Streaming front camera to PS4 - \(model.fps) fps"
+                  }
+                  return "Connected to PS4 - allow camera access"
+              }
+          }
+
+          // MARK: camera preview
+
+          final class PreviewUIView: UIView {
+              var onOrientation: ((AVCaptureVideoOrientation) -> Void)?
+
+              override class var layerClass: AnyClass {
+                  AVCaptureVideoPreviewLayer.self
+              }
+
+              var previewLayer: AVCaptureVideoPreviewLayer {
+                  // layerClass guarantees this cast.
+                  layer as! AVCaptureVideoPreviewLayer
+              }
+
+              override func layoutSubviews() {
+                  super.layoutSubviews()
+                  let orientation = currentVideoOrientation()
+                  if let connection = previewLayer.connection, connection.isVideoOrientationSupported {
+                      connection.videoOrientation = orientation
+                  }
+                  onOrientation?(orientation)
+              }
+          }
+
+          struct CameraPreview: UIViewRepresentable {
+              let session: AVCaptureSession
+              let onOrientation: (AVCaptureVideoOrientation) -> Void
+
+              func makeUIView(context: Context) -> PreviewUIView {
+                  let view = PreviewUIView()
+                  view.previewLayer.session = session
+                  view.previewLayer.videoGravity = .resizeAspect
+                  view.onOrientation = onOrientation
+                  return view
+              }
+
+              func updateUIView(_ uiView: PreviewUIView, context: Context) {
+                  uiView.onOrientation = onOrientation
+              }
+          }
+          CSC_EOF_5
+          find . -type f | sort
+
+      - name: Generate Xcode project
+        run: |
+          cd app
+          xcodegen generate
+          ls
+
+      - name: Build (unsigned)
+        run: |
+          set -o pipefail
+          cd app
+          xcodebuild -project CameraFromPhone.xcodeproj -scheme CameraFromPhone \
+            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee build.log \
+            || { echo; echo "===== ERRORS ====="; grep -E "error:" build.log | sort -u | head -40; exit 1; }
+
+      - name: Package IPA
+        run: |
+          cd app
+          APP=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n1)
+          echo "App bundle: $APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          zip -qry CameraFromPhone.ipa Payload
+          mkdir -p ../out && cp CameraFromPhone.ipa ../out/
+          ls -la ../out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: camera-from-phone-ipa
+          path: out/CameraFromPhone.ipa
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: app/build.log
+          if-no-files-found: ignore
